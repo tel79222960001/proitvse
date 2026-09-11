@@ -3,20 +3,25 @@
 # PROITVSE — агент новостей об ИИ для Telegram-канала.
 # Собирает новости из RSS, фильтрует, формирует дайджест и публикует 2 раза в день.
 #
-# Установка:  pip install feedparser requests
-# Запуск:
+# Установка:  pip install -r requirements.txt
+#
+# Режим 1 — постоянная работа (systemd/screen на своём сервере):
 #   export BOT_TOKEN="7123456789:AAHf..."   # токен от @BotFather
 #   export CHAT_ID="-1001234567890"         # id канала
 #   python proitvse_agent.py
 #
-# Опционально (суммаризация через ИИ, OpenAI-совместимый API):
+# Режим 2 — одноразовый запуск (GitHub Actions / cron):
+#   python proitvse_agent.py --once
+#   Собирает новости, публикует дайджест и завершает работу.
+#   Расписание задаёт внешний планировщик (workflow .github/workflows/digest.yml).
+#
+# Опционально (суммаризация через ИИ, OpenAI-совместимый API, например Kimi):
 #   export LLM_API_KEY="sk-..."
-#   export LLM_BASE_URL="https://api.openai.com/v1"
-#   export LLM_MODEL="gpt-4o-mini"
+#   export LLM_BASE_URL="https://api.moonshot.ai/v1"
+#   export LLM_MODEL="kimi-k2-0711-preview"
 # Без ключа публикуется заголовок + ссылка (тоже рабочий вариант).
-# Запуск 24/7: на VPS или домашнем ПК через systemd/screen.
 
-import os, json, time, logging, random
+import os, sys, json, time, logging, random
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -27,10 +32,10 @@ import requests
 BOT_TOKEN   = os.environ["BOT_TOKEN"]
 CHAT_ID     = os.environ["CHAT_ID"]
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-LLM_MODEL   = os.getenv("LLM_MODEL", "gpt-4o-mini")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.moonshot.ai/v1")
+LLM_MODEL   = os.getenv("LLM_MODEL", "kimi-k2-0711-preview")
 
-POST_TIMES = ["09:00", "20:00"]          # время публикации (час:мин)
+POST_TIMES = ["09:00", "20:00"]          # время публикации (час:мин) — только для режима демона
 MAX_NEWS_PER_POST = 5                    # новостей в одном дайджесте
 POSTED_DB = Path("posted_links.json")    # база опубликованных ссылок
 
@@ -59,11 +64,18 @@ log = logging.getLogger("proitvse")
 # ---------- БАЗА ОПУБЛИКОВАННЫХ ----------
 def load_posted():
     if POSTED_DB.exists():
-        return set(json.loads(POSTED_DB.read_text(encoding="utf-8")))
+        try:
+            return set(json.loads(POSTED_DB.read_text(encoding="utf-8")))
+        except Exception as ex:
+            log.warning("База ссылок повреждена, начинаю с пустой: %s", ex)
+            return set()
     return set()
 
 def save_posted(links):
-    POSTED_DB.write_text(json.dumps(list(links), ensure_ascii=False), encoding="utf-8")
+    # атомарная запись: сначала во временный файл, потом переименование
+    tmp = POSTED_DB.with_suffix(".tmp")
+    tmp.write_text(json.dumps(list(links), ensure_ascii=False), encoding="utf-8")
+    tmp.replace(POSTED_DB)
 
 # ---------- СБОР НОВОСТЕЙ ----------
 def is_relevant(title, summary=""):
@@ -98,7 +110,7 @@ def summarize(title, summary):
         return ""
     try:
         r = requests.post(
-            LLM_BASE_URL + "/chat/completions",
+            LLM_BASE_URL.rstrip("/") + "/chat/completions",
             headers={"Authorization": "Bearer " + LLM_API_KEY},
             json={
                 "model": LLM_MODEL,
@@ -141,7 +153,19 @@ def build_post(news):
     lines.append("Подписывайся: @proitvse")
     return "\n".join(lines)
 
-# ---------- РАСПИСАНИЕ ----------
+def publish_digest():
+    """Собрать новости и опубликовать дайджест. True — пост опубликован."""
+    posted = load_posted()
+    fresh = [n for n in fetch_news() if n["link"] not in posted][:MAX_NEWS_PER_POST]
+    if not fresh:
+        log.info("Новых новостей нет — пропуск")
+        return False
+    tg_post(build_post(fresh))
+    posted.update(n["link"] for n in fresh)
+    save_posted(posted)
+    return True
+
+# ---------- РАСПИСАНИЕ (режим демона) ----------
 def wait_until(hhmm):
     hh, mm = map(int, hhmm.split(":"))
     now = datetime.now()
@@ -154,18 +178,22 @@ def wait_until(hhmm):
 
 if __name__ == "__main__":
     log.info("PROITVSE agent запущен")
+
+    if "--once" in sys.argv:
+        # Одноразовый запуск для GitHub Actions / cron
+        try:
+            publish_digest()
+        except Exception as ex:
+            log.error("Ошибка публикации: %s", ex)
+            sys.exit(1)
+        sys.exit(0)
+
+    # Режим постоянной работы (systemd/screen)
     idx = 0
     while True:
-        wait_until(POST_TIMES[idx % 2])
-        posted = load_posted()
-        fresh = [n for n in fetch_news() if n["link"] not in posted][:MAX_NEWS_PER_POST]
-        if fresh:
-            try:
-                tg_post(build_post(fresh))
-                posted.update(n["link"] for n in fresh)
-                save_posted(posted)
-            except Exception as ex:
-                log.error("Ошибка публикации: %s", ex)
-        else:
-            log.info("Новых новостей нет — пропуск")
+        wait_until(POST_TIMES[idx % len(POST_TIMES)])
+        try:
+            publish_digest()
+        except Exception as ex:
+            log.error("Ошибка публикации: %s", ex)
         idx += 1
