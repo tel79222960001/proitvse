@@ -2,9 +2,9 @@ name: PROITVSE digest
 
 on:
   schedule:
-    # 09:00 и 20:00 МСК (UTC+3) = 06:00 и 17:00 UTC
-    - cron: '0 6 * * *'
-    - cron: '0 17 * * *'
+    # 09:00 и 20:00 МСК (UTC+5) = 06:00 и 17:00 UTC
+    - cron: '0 9 * * *'
+    - cron: '0 18 * * *'
   workflow_dispatch:   # ручной запуск: Actions → Run workflow
 
 permissions:
