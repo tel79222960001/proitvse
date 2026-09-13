@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # PROITVSE — агент новостей об ИИ для Telegram-канала.
-# Собирает новости из RSS, фильтрует, формирует дайджест и публикует 2 раза в день.
+# Публикует ОДНУ новость за запуск: выдержка из источника (до 10 предложений),
+# основной тезис, краткий вывод и ссылка. 2 поста в день: 09:00 и 18:00 по Екатеринбургу (UTC+5).
 #
 # Установка:  pip install -r requirements.txt
 #
@@ -12,16 +13,14 @@
 #
 # Режим 2 — одноразовый запуск (GitHub Actions / cron):
 #   python proitvse_agent.py --once
-#   Собирает новости, публикует дайджест и завершает работу.
-#   Расписание задаёт внешний планировщик (workflow .github/workflows/digest.yml).
 #
-# Опционально (суммаризация через ИИ, OpenAI-совместимый API, например Kimi):
+# Опционально (тезис и вывод через ИИ, OpenAI-совместимый API, например Kimi):
 #   export LLM_API_KEY="sk-..."
 #   export LLM_BASE_URL="https://api.moonshot.ai/v1"
 #   export LLM_MODEL="kimi-k2-0711-preview"
-# Без ключа публикуется заголовок + ссылка (тоже рабочий вариант).
+# Без ключа публикуется выдержка + ссылка (тоже рабочий вариант).
 
-import os, sys, json, time, logging, random
+import os, sys, re, json, time, logging, random, html as html_mod
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -35,9 +34,9 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.moonshot.ai/v1")
 LLM_MODEL   = os.getenv("LLM_MODEL", "kimi-k2-0711-preview")
 
-POST_TIMES = ["09:00", "20:00"]          # время публикации (час:мин) — только для режима демона
-MAX_NEWS_PER_POST = 5                    # новостей в одном дайджесте
-POSTED_DB = Path("posted_links.json")    # база опубликованных ссылок
+POST_TIMES = ["09:00", "18:00"]   # 2 поста в день, время Екатеринбург (UTC+5, только режим демона)
+MAX_SENTENCES = 10                        # предложений в выдержке из источника
+POSTED_DB = Path("posted_links.json")     # база опубликованных ссылок
 
 RSS_SOURCES = [
     "https://openai.com/news/rss.xml",
@@ -58,6 +57,8 @@ KEYWORDS = [
 
 STOPWORDS = ["crypto", "nft", "bitcoin", "крипт", "биткоин"]
 
+EMOJIS = ["🤖", "🧠", "⚡", "🚀", "🔥", "💡", "🦾", "📡"]
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("proitvse")
 
@@ -72,7 +73,6 @@ def load_posted():
     return set()
 
 def save_posted(links):
-    # атомарная запись: сначала во временный файл, потом переименование
     tmp = POSTED_DB.with_suffix(".tmp")
     tmp.write_text(json.dumps(list(links), ensure_ascii=False), encoding="utf-8")
     tmp.replace(POSTED_DB)
@@ -95,7 +95,7 @@ def fetch_news():
                     continue
                 seen.add(link)
                 title = e.get("title", "").strip()
-                summary = e.get("summary", "")[:500]
+                summary = e.get("summary", "")[:2000]
                 if is_relevant(title, summary):
                     news.append({"title": title, "link": link, "summary": summary})
         except Exception as ex:
@@ -104,10 +104,25 @@ def fetch_news():
     random.shuffle(news)
     return news
 
-# ---------- СУММАРИЗАЦИЯ (опционально) ----------
-def summarize(title, summary):
-    if not LLM_API_KEY:
+# ---------- ТЕКСТ: ВЫДЕРЖКА, ТЕЗИС, ВЫВОД ----------
+def strip_html(s):
+    s = re.sub(r"<[^>]+>", " ", s or "")
+    s = html_mod.unescape(s)
+    return re.sub(r"\s+", " ", s).strip()
+
+def excerpt_of(summary, max_sentences=MAX_SENTENCES):
+    """Выдержка из источника: чистый текст, до max_sentences предложений."""
+    text = strip_html(summary)
+    if not text:
         return ""
+    sentences = re.split(r"(?<=[.!?\u2026])\s+", text)
+    return " ".join(sentences[:max_sentences]).strip()
+
+def analyze(title, excerpt):
+    """LLM: основной тезис (1 предложение) и вывод (1-2 предложения).
+    Возвращает (тезис, вывод). Без ключа — пустые строки."""
+    if not LLM_API_KEY or not excerpt:
+        return "", ""
     try:
         r = requests.post(
             LLM_BASE_URL.rstrip("/") + "/chat/completions",
@@ -116,52 +131,79 @@ def summarize(title, summary):
                 "model": LLM_MODEL,
                 "messages": [{
                     "role": "user",
-                    "content": ("Перескажи новость об ИИ одним предложением на русском, "
-                                "до 180 символов, без воды и кликбейта.\n\n"
-                                "Заголовок: " + title + "\nТекст: " + summary[:1000])
+                    "content": ("Новость: " + title +
+                                "\n\nТекст: " + excerpt[:2500] +
+                                "\n\nОтветь строго двумя строками без лишнего:\n"
+                                "ТЕЗИС: одно предложение — главная суть новости\n"
+                                "ВЫВОД: одно-два предложения — почему это важно для рынка ИИ")
                 }],
-                "max_tokens": 120, "temperature": 0.3,
+                "max_tokens": 250, "temperature": 0.3,
             },
-            timeout=30,
+            timeout=40,
         )
-        return r.json()["choices"][0]["message"]["content"].strip()
+        text = r.json()["choices"][0]["message"]["content"].strip()
+        thesis, conclusion = "", ""
+        for line in text.splitlines():
+            if line.upper().startswith("ТЕЗИС:"):
+                thesis = line.split(":", 1)[1].strip()
+            elif line.upper().startswith("ВЫВОД:"):
+                conclusion = line.split(":", 1)[1].strip()
+        return thesis, conclusion
     except Exception as ex:
-        log.warning("Суммаризация не удалась: %s", ex)
-        return ""
+        log.warning("Анализ LLM не удался: %s", ex)
+        return "", ""
 
 # ---------- ПУБЛИКАЦИЯ ----------
 def tg_post(text):
     r = requests.post(
         "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage",
         json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
-              "disable_web_page_preview": True},
+              "disable_web_page_preview": False},
         timeout=30,
     )
     r.raise_for_status()
     log.info("Пост опубликован")
 
 def build_post(news):
-    now = datetime.now().strftime("%d.%m.%Y")
-    period = "☀️ Утренний" if datetime.now().hour < 15 else "🌙 Вечерний"
-    lines = [period + " дайджест AI-новостей | " + now + "\n"]
-    for i, n in enumerate(news, 1):
-        short = summarize(n["title"], n["summary"])
-        lines.append(str(i) + ". <b>" + n["title"] + "</b>")
-        if short:
-            lines.append(short)
-        lines.append("<a href=\"" + n["link"] + "\">Читать →</a>\n")
-    lines.append("Подписывайся: @proitvse")
-    return "\n".join(lines)
+    """Один пост = одна новость: заголовок, выдержка, тезис, вывод, ссылка."""
+    title, link, summary = news["title"], news["link"], news["summary"]
+    excerpt = excerpt_of(summary)
+    thesis, conclusion = analyze(title, excerpt)
 
-def publish_digest():
-    """Собрать новости и опубликовать дайджест. True — пост опубликован."""
+    lines = [random.choice(EMOJIS) + " <b>" + title + "</b>", ""]
+    if excerpt:
+        lines.append("📝 <i>Выдержка из источника:</i>")
+        lines.append(excerpt)
+        lines.append("")
+    if thesis:
+        lines.append("🎯 <b>Тезис:</b> " + thesis)
+    if conclusion:
+        lines.append("💡 <b>Вывод:</b> " + conclusion)
+    if thesis or conclusion:
+        lines.append("")
+    lines.append('<a href="' + link + '">🔗 Источник</a>')
+    lines.append("")
+    lines.append("Подписывайся: @proitvse")
+
+    text = "\n".join(lines)
+    # лимит Telegram — 4096 символов; ужимаем выдержку, если не влезает
+    while len(text) > 4000 and " " in excerpt:
+        parts = excerpt.rsplit(" ", 1)
+        excerpt = parts[0]
+        lines[2] = excerpt + " …"
+        text = "\n".join(lines)
+    return text
+
+def publish_next():
+    """Опубликовать следующую свежую новость. True — пост вышел."""
     posted = load_posted()
-    fresh = [n for n in fetch_news() if n["link"] not in posted][:MAX_NEWS_PER_POST]
+    fresh = [n for n in fetch_news() if n["link"] not in posted]
     if not fresh:
         log.info("Новых новостей нет — пропуск")
         return False
-    tg_post(build_post(fresh))
-    posted.update(n["link"] for n in fresh)
+    news = fresh[0]
+    tg_post(build_post(news))
+    posted.add(news["link"])
     save_posted(posted)
     return True
 
@@ -180,20 +222,18 @@ if __name__ == "__main__":
     log.info("PROITVSE agent запущен")
 
     if "--once" in sys.argv:
-        # Одноразовый запуск для GitHub Actions / cron
         try:
-            publish_digest()
+            publish_next()
         except Exception as ex:
             log.error("Ошибка публикации: %s", ex)
             sys.exit(1)
         sys.exit(0)
 
-    # Режим постоянной работы (systemd/screen)
     idx = 0
     while True:
         wait_until(POST_TIMES[idx % len(POST_TIMES)])
         try:
-            publish_digest()
+            publish_next()
         except Exception as ex:
             log.error("Ошибка публикации: %s", ex)
         idx += 1
