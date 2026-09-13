@@ -59,6 +59,9 @@ STOPWORDS = ["crypto", "nft", "bitcoin", "крипт", "биткоин"]
 
 EMOJIS = ["🤖", "🧠", "⚡", "🚀", "🔥", "💡", "🦾", "📡"]
 
+FEED_UA = {"User-Agent": "proitvse-bot/1.0 (+https://t.me/proitvse)"}  # Reddit и др. режут запросы без UA
+MAX_POSTED = 5000                                # ротация базы опубликованных ссылок
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("proitvse")
 
@@ -74,7 +77,7 @@ def load_posted():
 
 def save_posted(links):
     tmp = POSTED_DB.with_suffix(".tmp")
-    tmp.write_text(json.dumps(list(links), ensure_ascii=False), encoding="utf-8")
+    tmp.write_text(json.dumps(list(links)[-MAX_POSTED:], ensure_ascii=False), encoding="utf-8")
     tmp.replace(POSTED_DB)
 
 # ---------- СБОР НОВОСТЕЙ ----------
@@ -88,7 +91,7 @@ def fetch_news():
     news, seen = [], set()
     for url in RSS_SOURCES:
         try:
-            feed = feedparser.parse(url)
+            feed = feedparser.parse(url, request_headers=FEED_UA)
             for e in feed.entries[:10]:
                 link = getattr(e, "link", "")
                 if not link or link in seen:
@@ -115,7 +118,7 @@ def excerpt_of(summary, max_sentences=MAX_SENTENCES):
     text = strip_html(summary)
     if not text:
         return ""
-    sentences = re.split(r"(?<=[.!?\u2026])\s+", text)
+    sentences = re.split(r"(?<=[.!?…])\s+", text)
     return " ".join(sentences[:max_sentences]).strip()
 
 def analyze(title, excerpt):
@@ -155,14 +158,26 @@ def analyze(title, excerpt):
 
 # ---------- ПУБЛИКАЦИЯ ----------
 def tg_post(text):
-    r = requests.post(
-        "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage",
-        json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
-              "disable_web_page_preview": False},
-        timeout=30,
-    )
-    r.raise_for_status()
-    log.info("Пост опубликован")
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage",
+                json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+                      "disable_web_page_preview": False},
+                timeout=30,
+            )
+            if r.status_code == 429:                     # Telegram просит подождать
+                wait = r.json().get("parameters", {}).get("retry_after", 10)
+                log.warning("Rate limit, жду %s с", wait)
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            log.info("Пост опубликован")
+            return
+        except requests.RequestException as ex:
+            log.warning("Попытка %d/3 не удалась: %s", attempt + 1, ex)
+            time.sleep(5 * (attempt + 1))
+    raise RuntimeError("Не удалось опубликовать пост после 3 попыток")
 
 def build_post(news):
     """Один пост = одна новость: заголовок, выдержка, тезис, вывод, ссылка."""
@@ -170,28 +185,27 @@ def build_post(news):
     excerpt = excerpt_of(summary)
     thesis, conclusion = analyze(title, excerpt)
 
-    lines = [random.choice(EMOJIS) + " <b>" + title + "</b>", ""]
+    # Telegram с parse_mode=HTML требует экранирования &, <, > — иначе 400 can't parse entities
+    header = [random.choice(EMOJIS) + " <b>" + html_mod.escape(title) + "</b>", ""]
+    excerpt_block = []
     if excerpt:
-        lines.append("📝 <i>Выдержка из источника:</i>")
-        lines.append(excerpt)
-        lines.append("")
+        excerpt_block = ["📝 <i>Выдержка из источника:</i>", html_mod.escape(excerpt), ""]
+    analysis = []
     if thesis:
-        lines.append("🎯 <b>Тезис:</b> " + thesis)
+        analysis.append("🎯 <b>Тезис:</b> " + html_mod.escape(thesis))
     if conclusion:
-        lines.append("💡 <b>Вывод:</b> " + conclusion)
-    if thesis or conclusion:
-        lines.append("")
-    lines.append('<a href="' + link + '">🔗 Источник</a>')
-    lines.append("")
-    lines.append("Подписывайся: @proitvse")
+        analysis.append("💡 <b>Вывод:</b> " + html_mod.escape(conclusion))
+    if analysis:
+        analysis.append("")
+    footer = ['<a href="' + html_mod.escape(link, quote=True) + '">🔗 Источник</a>',
+              "", "Подписывайся: @proitvse"]
 
-    text = "\n".join(lines)
+    text = "\n".join(header + excerpt_block + analysis + footer)
     # лимит Telegram — 4096 символов; ужимаем выдержку, если не влезает
-    while len(text) > 4000 and " " in excerpt:
-        parts = excerpt.rsplit(" ", 1)
-        excerpt = parts[0]
-        lines[2] = excerpt + " …"
-        text = "\n".join(lines)
+    while len(text) > 4000 and excerpt and " " in excerpt:
+        excerpt = excerpt.rsplit(" ", 1)[0]
+        excerpt_block[1] = html_mod.escape(excerpt) + " …"
+        text = "\n".join(header + excerpt_block + analysis + footer)
     return text
 
 def publish_next():
