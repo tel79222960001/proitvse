@@ -3,6 +3,9 @@
 # PROITVSE — агент новостей об ИИ для Telegram-канала.
 # Публикует ОДНУ новость за запуск: выдержка из источника (до 10 предложений),
 # основной тезис, краткий вывод и ссылка. 2 поста в день: 09:00 и 18:00 по Екатеринбургу (UTC+5).
+# Англоязычные источники переводятся на русский автоматически: сначала через LLM
+# (тот же LLM_API_KEY, что для тезисов), при его отсутствии — через бесплатный MyMemory.
+# Если перевод недоступен, публикуется оригинал с пометкой об автопереводе.
 #
 # Установка:  pip install -r requirements.txt
 #
@@ -14,11 +17,11 @@
 # Режим 2 — одноразовый запуск (GitHub Actions / cron):
 #   python proitvse_agent.py --once
 #
-# Опционально (тезис и вывод через ИИ, OpenAI-совместимый API, например Kimi):
+# Опционально (тезис, вывод и перевод через ИИ, OpenAI-совместимый API, например Kimi):
 #   export LLM_API_KEY="sk-..."
 #   export LLM_BASE_URL="https://api.moonshot.ai/v1"
 #   export LLM_MODEL="kimi-k2-0711-preview"
-# Без ключа публикуется выдержка + ссылка (тоже рабочий вариант).
+# Без ключа публикуется выдержка + ссылка (тоже рабочий вариант), перевод — через MyMemory.
 
 import os, sys, re, json, time, logging, random, html as html_mod
 from datetime import datetime, timedelta
@@ -156,6 +159,98 @@ def analyze(title, excerpt):
         log.warning("Анализ LLM не удался: %s", ex)
         return "", ""
 
+# ---------- ПЕРЕВОД АНГЛОЯЗЫЧНЫХ ИСТОЧНИКОВ ----------
+def detect_lang(text):
+    """'ru', если в тексте есть кириллица, иначе 'en'. Пустой/буквенный мусор считаем английским."""
+    if not text:
+        return "ru"
+    letters = [ch for ch in text if ch.isalpha()]
+    if not letters:
+        return "en"
+    cyr = sum(1 for ch in letters if "Ѐ" <= ch <= "ӿ")
+    return "ru" if cyr / len(letters) > 0.05 else "en"
+
+def translate_llm(title, excerpt):
+    """Перевод заголовка и выдержки через LLM. Возвращает (title_ru, excerpt_ru) или None."""
+    r = requests.post(
+        LLM_BASE_URL.rstrip("/") + "/chat/completions",
+        headers={"Authorization": "Bearer " + LLM_API_KEY},
+        json={
+            "model": LLM_MODEL,
+            "messages": [{
+                "role": "user",
+                "content": ("Переведи на русский язык заголовок и текст новости об ИИ. "
+                            "Сохрани терминологию (названия моделей, компаний, продуктов не переводить). "
+                            "Ответь строго в формате:\n"
+                            "ЗАГОЛОВОК: <перевод заголовка>\n"
+                            "ВЫДЕРЖКА: <перевод текста>\n\n"
+                            "Заголовок: " + title +
+                            "\n\nТекст: " + excerpt[:2500])
+            }],
+            "max_tokens": 2000, "temperature": 0.2,
+        },
+        timeout=60,
+    )
+    text = r.json()["choices"][0]["message"]["content"].strip()
+    title_ru = excerpt_ru = None
+    for line in text.splitlines():
+        if line.upper().startswith("ЗАГОЛОВОК:"):
+            title_ru = line.split(":", 1)[1].strip()
+        elif line.upper().startswith("ВЫДЕРЖКА:"):
+            excerpt_ru = line.split(":", 1)[1].strip()
+    if not title_ru or not excerpt_ru:
+        return None
+    return title_ru, excerpt_ru
+
+def _chunks(text, size=450):
+    """Разбить текст на куски не длиннее size символов по границам слов (лимит MyMemory)."""
+    out, cur = [], []
+    for w in text.split():
+        if cur and sum(len(x) + 1 for x in cur) + len(w) > size:
+            out.append(" ".join(cur)); cur = [w]
+        else:
+            cur.append(w)
+    if cur:
+        out.append(" ".join(cur))
+    return out or [text]
+
+def translate_mymemory(text, target="ru"):
+    """Бесплатный перевод без ключа (MyMemory, лимит ~5000 симв./день). None при сбое."""
+    try:
+        parts = []
+        for chunk in _chunks(text):
+            r = requests.get(
+                "https://api.mymemory.translated.net/get",
+                params={"q": chunk, "langpair": "en|" + target},
+                timeout=20,
+            )
+            translated = r.json()["responseData"]["translatedText"]
+            if "MYMEMORY WARNING" in translated.upper():   # дневная квота исчерпана
+                return None
+            parts.append(translated)
+            time.sleep(0.3)
+        return " ".join(parts)
+    except Exception as ex:
+        log.warning("MyMemory-перевод не удался: %s", ex)
+        return None
+
+def translate_news(title, excerpt):
+    """Перевести англоязычную новость на русский.
+    Возвращает (title_ru, excerpt_ru, translated_ok). При сбое — оригиналы и False."""
+    if LLM_API_KEY and excerpt:
+        try:
+            result = translate_llm(title, excerpt)
+            if result:
+                return result[0], result[1], True
+            log.warning("LLM-перевод: не удалось разобрать ответ, пробую MyMemory")
+        except Exception as ex:
+            log.warning("LLM-перевод не удался (%s), пробую MyMemory", ex)
+    title_ru = translate_mymemory(title) if title else None
+    excerpt_ru = translate_mymemory(excerpt) if excerpt else None
+    if title_ru and (not excerpt or excerpt_ru):
+        return title_ru, excerpt_ru or excerpt, True
+    return title, excerpt, False
+
 # ---------- ПУБЛИКАЦИЯ ----------
 def tg_post(text):
     for attempt in range(3):
@@ -183,10 +278,23 @@ def build_post(news):
     """Один пост = одна новость: заголовок, выдержка, тезис, вывод, ссылка."""
     title, link, summary = news["title"], news["link"], news["summary"]
     excerpt = excerpt_of(summary)
+
+    # англоязычные источники переводим на русский перед анализом и публикацией
+    translated = False
+    if detect_lang(title + " " + excerpt) == "en":
+        title, excerpt, translated = translate_news(title, excerpt)
+        log.info("Источник на английском — перевод %s",
+                 "выполнен" if translated else "недоступен, публикуется оригинал")
+
     thesis, conclusion = analyze(title, excerpt)
 
     # Telegram с parse_mode=HTML требует экранирования &, <, > — иначе 400 can't parse entities
-    header = [random.choice(EMOJIS) + " <b>" + html_mod.escape(title) + "</b>", ""]
+    header = [random.choice(EMOJIS) + " <b>" + html_mod.escape(title) + "</b>"]
+    if detect_lang(title) == "en":   # перевода не было — помечаем пост
+        header.append("🌐 <i>Источник на английском (автоперевод временно недоступен)</i>")
+    elif translated:
+        header.append("🌐 <i>Автоперевод с английского</i>")
+    header.append("")
     excerpt_block = []
     if excerpt:
         excerpt_block = ["📝 <i>Выдержка из источника:</i>", html_mod.escape(excerpt), ""]
